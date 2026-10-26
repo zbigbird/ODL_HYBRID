@@ -201,14 +201,16 @@ jobs:
               docker compose --env-file .env -f compose.yaml up -d odl-hybrid
           EOF
           )
-          num=$(gh issue list --state open --limit 100 --json number,title \
+          # 本 job 不做 checkout，gh 无法从 git remote 推断仓库，必须显式 -R
+          repo="${{ github.repository }}"
+          num=$(gh issue list -R "$repo" --state open --limit 100 --json number,title \
                 --jq '.[] | "\(.number)\t\(.title)"' \
                 | awk -F'\t' -v t="$title" '$2==t {print $1; exit}')
           if [ -n "${num:-}" ]; then
             echo "→ 复用已存在的 Issue #${num}"
-            gh issue comment "$num" --body "$body"
+            gh issue comment -R "$repo" "$num" --body "$body"
           else
-            gh issue create --title "$title" --body "$body"
+            gh issue create -R "$repo" --title "$title" --body "$body"
           fi
 
       - name: Webhook 通知（可选，未配置 NOTIFY_WEBHOOK 则跳过）
