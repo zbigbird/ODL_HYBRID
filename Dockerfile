@@ -31,9 +31,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates libgl1 libglib2.0-0 libgomp1 libsm6 \
     && rm -rf /var/lib/apt/lists/*
 
-# ① CPU-only torch：PyTorch 官方 cpu 索引自带依赖解析，不需要 --extra-index-url
-#    （加了反而可能让 pip 选到 PyPI 上更高版本的 CUDA wheel，多拉数 GB）
-RUN pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+# ① CPU-only torch。
+#    PyTorch 的 cpu 索引对“依赖包”只是按需转链，部分条目只有 sdist（如 typing_extensions 4.16.0），
+#    构建这些 sdist 需要 flit_core 等后端 —— 该索引本身不提供，会报
+#      ERROR: Could not find a version that satisfies the requirement flit_core<4,>=3.11
+#    所以：先装构建后端（走 PyPI），再用 cpu 索引装 torch，并允许 PyPI 作为依赖兜底。
+#    安装后用 torch.version.cuda is None 断言“确实是 CPU 版”，防止 PyPI 上更高版本的
+#    CUDA wheel 被误选（真被选中时构建直接失败，而不是悄悄产出 8 GB 镜像）。
+ARG TORCH_SPEC="torch torchvision"
+RUN pip install --no-cache-dir --index-url https://pypi.org/simple \
+        flit_core setuptools wheel hatchling poetry-core packaging setuptools_scm \
+    && pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple \
+        ${TORCH_SPEC} \
+    && python -c "import torch; assert torch.version.cuda is None, f'CUDA build leaked: {torch.__version__}'; print('torch', torch.__version__)"
 
 # ② opendataloader-pdf[hybrid]：torch/torchvision 已满足，不会回退去拉 CUDA 版
 RUN if [ -n "$PIP_INDEX_URL_CN" ]; then \
