@@ -4,15 +4,18 @@
 # 触发：
 #   · schedule 每周一 03:00 UTC：自动检查上游是否有变化
 #   · push 到 main 且改了 Dockerfile / 本 workflow
-#   · 手动 workflow_dispatch（可 force 强制重建）
+#   · 手动 workflow_dispatch（force 强制重建 / simulate_change 只测通知链路）
 #
 # “跟随上游”的两条判定（任一变化即产生新 tag → 触发重建）：
 #   1. PyPI 上 opendataloader-pdf 的 latest 版本
 #   2. 上游 Tencent/WeKnora main 分支 docker/Dockerfile.odl-hybrid 的 sha256 前 12 位
-#   tag 形如：odl2.4.7-w1a2b3c4d5e6f
+#   tag 形如：odl2.5.15-w2673a4d99ff0
 #   若该 tag 在 GHCR 已存在则跳过构建（幂等，不重复烧 CI 分钟）。
 #
-# 凭据：只用内置 GITHUB_TOKEN（permissions.packages: write），无需任何 Secret。
+# 检测到“新 tag 需要构建”时，report 任务会自动开 Issue（同标题已存在则改为评论），
+# 并可选地 POST 到 NOTIFY_WEBHOOK（未配置则跳过）。
+#
+# 凭据：只用内置 GITHUB_TOKEN（packages: write / issues: write），无需任何自定义 Secret。
 # =============================================================================
 name: build-odl-hybrid
 
@@ -25,6 +28,10 @@ on:
         description: '强制重建（即使同 tag 已存在）'
         type: boolean
         default: false
+      simulate_change:
+        description: '仅测试“上游变更 → 开 Issue”链路（不重建镜像）'
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -34,6 +41,7 @@ on:
 permissions:
   contents: read
   packages: write
+  issues: write
 
 concurrency:
   group: odl-hybrid-build
@@ -89,15 +97,10 @@ jobs:
     if: needs.detect.outputs.exists == 'false' || github.event.inputs.force == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
         uses: docker/login-action@v3
@@ -105,12 +108,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 计算镜像坐标
-        id: meta
-        run: |
-          echo "image=${IMAGE}:${{ needs.detect.outputs.tag }}" >> "$GITHUB_OUTPUT"
-          echo "target=${IMAGE}:${{ needs.detect.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         id: push
@@ -152,9 +149,7 @@ jobs:
             docker logs --tail 200 odl-smoke || true
             exit 1
           fi
-          curl -fsS http://127.0.0.1:15002/health; echo
           docker inspect -f 'health={{.State.Health.Status}} oomKilled={{.State.OOMKilled}}' odl-smoke
-          docker stats --no-stream --format 'mem={{.MemUsage}}' odl-smoke
 
       - name: Cleanup
         if: always()
@@ -164,7 +159,6 @@ jobs:
         run: |
           {
             echo "## 构建产物"
-            echo ""
             echo '```'
             echo "image : ${{ env.IMAGE }}:${{ needs.detect.outputs.tag }}"
             echo "tag   : ${{ needs.detect.outputs.tag }}"
@@ -172,6 +166,68 @@ jobs:
             echo "上游  : Tencent/WeKnora docker/Dockerfile.odl-hybrid sha256=${{ needs.detect.outputs.upstream_sha }}"
             echo "digest: ${{ steps.push.outputs.digest }}"
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  report:
+    name: 上游变更通知
+    needs: [detect, build]
+    if: always() && (needs.detect.outputs.exists == 'false' || github.event.inputs.simulate_change == 'true')
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WEBHOOK: ${{ secrets.NOTIFY_WEBHOOK }}
+      TAG: ${{ needs.detect.outputs.tag }}
+      ODL: ${{ needs.detect.outputs.odl }}
+      UP: ${{ needs.detect.outputs.upstream_sha }}
+      BUILD_RESULT: ${{ needs.build.result }}
+      RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: 开 Issue（同标题已存在则评论）
+        run: |
+          set -euo pipefail
+          title="odl-hybrid 上游更新：${TAG}"
+          body=$(cat <<EOF
+          检测到上游变化，已触发 odl-hybrid 镜像重建。
+
+          - tag: ${TAG}
+          - opendataloader-pdf: ${ODL}
+          - 上游 Dockerfile sha: ${UP}
+          - 构建结果: ${BUILD_RESULT}
+          - 运行记录: ${RUN_URL}
+
+          塔上更新命令：
+
+              docker compose --env-file .env -f compose.yaml pull odl-hybrid
+              docker compose --env-file .env -f compose.yaml up -d odl-hybrid
+          EOF
+          )
+          num=$(gh issue list --state open --limit 100 --json number,title \
+                --jq '.[] | "\(.number)\t\(.title)"' \
+                | awk -F'\t' -v t="$title" '$2==t {print $1; exit}')
+          if [ -n "${num:-}" ]; then
+            echo "→ 复用已存在的 Issue #${num}"
+            gh issue comment "$num" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Webhook 通知（可选，未配置 NOTIFY_WEBHOOK 则跳过）
+        if: env.WEBHOOK != ''
+        run: |
+          curl -fsS -X POST "$WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\":\"odl-hybrid 上游更新 ${TAG}（build=${BUILD_RESULT}） ${RUN_URL}\"}" \
+            || echo "webhook 发送失败（忽略）"
+
+      - name: 摘要
+        run: |
+          {
+            echo "## 上游变更"
             echo ""
-            echo "拉取：\`docker pull ${{ env.IMAGE }}:${{ needs.detect.outputs.tag }}\`"
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| tag | \`${TAG}\` |"
+            echo "| opendataloader-pdf | \`${ODL}\` |"
+            echo "| 上游 Dockerfile sha | \`${UP}\` |"
+            echo "| 构建结果 | \`${BUILD_RESULT}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
